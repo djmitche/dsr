@@ -1,0 +1,10 @@
+[package]
+name = "dsr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bus = "2.4.1"
+log = "0.4.28"
+pretty_env_logger = "0.5.0"
+uuid = { version = "1.18.1", features = ["v4"] }
