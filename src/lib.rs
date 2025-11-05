@@ -1,16 +1,35 @@
 #![allow(unused)]
-use log::info;
+use log::{info, debug};
+use rand::prelude::*;
+use rand::seq::IndexedRandom;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
+// TODO:
+//  - break into modules
+//  - RCU data structure for ServerDb
+//  - check for accuracy
+//  - benchmark
+
+// ---
+
+#[derive(Debug, Clone)]
+pub enum Update {
+    /// Set a value in the data store, overwriting any value that may exist.
+    Set(String, String),
+    /// Delete a value from the data store.
+    Delete(String),
+}
+
 // ---
 
 #[derive(Debug, Clone)]
 pub struct Version {
     version_id: Uuid,
+    updates: Vec<Update>,
 }
 
 // ---
@@ -86,18 +105,29 @@ pub struct Upstream {
 
 // ---
 
+/// Number of keys to use in the fake intake.
+const FAKE_INTAKE_NUM_KEYS: usize = 2;
+
 /// Intake is where data enters the system to be distributed downward
 /// to subsidiary nodes.
 pub struct FakeIntake {
+    name: String,
     downstream: Downstream,
     server_db: ServerDb,
+    keys: [Uuid; FAKE_INTAKE_NUM_KEYS],
 }
 
 impl FakeIntake {
-    pub fn new(server_db: ServerDb) -> Self {
+    pub fn new(name: String, server_db: ServerDb) -> Self {
         Self {
+            name,
             downstream: Downstream::new(),
             server_db,
+            keys: (0..FAKE_INTAKE_NUM_KEYS)
+                .map(|_| Uuid::new_v4())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
         }
     }
 
@@ -133,30 +163,59 @@ impl FakeIntake {
 
             // Create a new version
             let new_version_id = Uuid::new_v4();
-            info!("Creating version {}", new_version_id);
+            info!("{}: Creating version {}", self.name, new_version_id);
             let v = Version {
                 version_id: new_version_id,
+                updates: self.random_updates(),
             };
-            self.server_db.add_version(v);
+            self.server_db.apply_version(v);
 
             // Notify downstream of new version
-            info!("Sending new-version notice");
+            info!("{}: Sending new-version notice", self.name);
             self.downstream.notices.broadcast(Notice::NewVersion);
         }
+    }
+
+    fn random_key(&mut self) -> String {
+        self.keys
+            .choose(&mut rand::rng())
+            .cloned()
+            .unwrap()
+            .to_string()
+    }
+
+    fn random_value(&self) -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    fn random_updates(&mut self) -> Vec<Update> {
+        let n = rand::random::<u8>().saturating_add(1);
+        let mut updates = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let key = self.random_key();
+            if rand::random::<bool>() {
+                updates.push(Update::Set(key, self.random_value()))
+            } else {
+                updates.push(Update::Delete(key))
+            }
+        }
+        updates
     }
 }
 
 // ---
 
 pub struct CachingIntermediate {
+    name: String,
     upstream: Upstream,
     downstream: Downstream,
     server_db: ServerDb,
 }
 
 impl CachingIntermediate {
-    pub fn new(upstream: Upstream) -> Self {
+    pub fn new(name: String, upstream: Upstream) -> Self {
         Self {
+            name,
             upstream,
             downstream: Downstream::new(),
             server_db: ServerDb::default(),
@@ -173,13 +232,15 @@ impl CachingIntermediate {
 
     fn run(mut self) {
         let snapshot = self.get_snapshot();
-        info!("Starting at snapshot version {}", snapshot.version_id);
+        info!(
+            "{}: Starting at snapshot version {}",
+            self.name, snapshot.version_id
+        );
         self.server_db.apply_snapshot(snapshot);
 
         loop {
             // We would like to do all of these receives in parallel, but sync channels
             // do not support this, so just loop through them quickly.
-            info!("Intermediate handling requests");
             match self
                 .downstream
                 .requests_rx
@@ -187,6 +248,7 @@ impl CachingIntermediate {
             {
                 Ok(req) => match req {
                     Request::GetChildVersion(uuid, sender) => {
+                        info!("{}: Got GetChildVersion request", self.name);
                         if let Some(v) = self.server_db.get_child_version(uuid) {
                             // We have the version locally, so just send that.
                             sender.send(Some(v)).expect("send failed");
@@ -203,24 +265,26 @@ impl CachingIntermediate {
                             if let Some(v) = &from_upstream {
                                 self.server_db.cache_version(uuid, v.clone());
                             }
-                            sender
-                                .send(from_upstream)
-                                .expect("send failed")
+                            sender.send(from_upstream).expect("send failed")
                         }
                     }
                     Request::GetSnapshot(sender) => {
+                        info!("{}: Got GetSnapshot request", self.name);
                         // Always send a local snapshot, rather than deferring this to
                         // upstream.
                         sender.send(self.server_db.get_snapshot());
                     }
                 },
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {},
                 Err(e) => panic!("error receiving requests: {e}"),
             }
 
             // Update to the most recent version, if there's a notice.
             if self.upstream.notices.try_recv().is_ok() {
-                info!("Intermediate updating to latest");
+                // Consume all of the notices, in case they "bunch up".
+                while self.upstream.notices.try_recv().is_ok() {}
+
+                info!("{}: Intermediate updating to latest", self.name);
                 loop {
                     let (tx, rx) = mpsc::channel();
                     self.upstream.requests.send(Request::GetChildVersion(
@@ -228,17 +292,16 @@ impl CachingIntermediate {
                         tx,
                     ));
                     if let Some(v) = rx.recv().expect("receive failed") {
-                        info!("Got version {}", v.version_id);
-                        self.server_db.add_version(v);
+                        info!("{}: Got version {}", self.name, v.version_id);
+                        self.server_db.apply_version(v);
                     } else {
                         break;
                     }
                 }
-            }
-        }
 
-        for notice in self.upstream.notices.iter() {
-            info!("Got notice {notice:?}");
+                info!("{}: Sending new-version notice", self.name);
+                self.downstream.notices.broadcast(Notice::NewVersion);
+            }
         }
     }
 
@@ -252,13 +315,15 @@ impl CachingIntermediate {
 // ---
 
 pub struct DebugLeaf {
+    name: String,
     upstream: Upstream,
     server_db: ServerDb,
 }
 
 impl DebugLeaf {
-    pub fn new(upstream: Upstream) -> Self {
+    pub fn new(name: String, upstream: Upstream) -> Self {
         Self {
+            name,
             upstream,
             server_db: ServerDb::default(),
         }
@@ -269,8 +334,12 @@ impl DebugLeaf {
     }
 
     fn run(mut self) {
+        info!("{}: Getting snapshot", self.name);
         let snapshot = self.get_snapshot();
-        info!("Starting at snapshot version {}", snapshot.version_id);
+        info!(
+            "{}: Starting at snapshot version {}",
+            self.name, snapshot.version_id
+        );
         self.server_db.apply_snapshot(snapshot);
         loop {
             // Update to the most recent version.
@@ -281,8 +350,8 @@ impl DebugLeaf {
                     tx,
                 ));
                 if let Some(v) = rx.recv().expect("receive failed") {
-                    info!("Got version {}", v.version_id);
-                    self.server_db.add_version(v);
+                    info!("{}: Got version {}", self.name, v.version_id);
+                    self.server_db.apply_version(v);
                 } else {
                     break;
                 }
@@ -328,12 +397,15 @@ impl ServerDb {
             .get_current_version_id()
     }
 
-    fn add_version(&self, v: Version) {
-        self.inner.lock().expect("lock failed").add_version(v);
+    fn apply_version(&self, v: Version) {
+        self.inner.lock().expect("lock failed").apply_version(v);
     }
 
     fn cache_version(&self, parent_version_id: Uuid, v: Version) {
-        self.inner.lock().expect("lock failed").cache_version(parent_version_id, v);
+        self.inner
+            .lock()
+            .expect("lock failed")
+            .cache_version(parent_version_id, v);
     }
 
     fn get_child_version(&self, uuid: Uuid) -> Option<Version> {
@@ -360,7 +432,10 @@ impl ServerDbInner {
         self.current_version_id
     }
 
-    fn add_version(&mut self, v: Version) {
+    fn apply_version(&mut self, mut v: Version) {
+        for upd in v.updates.drain(..) {
+            self.apply_update(upd);
+        }
         let new_version_id = v.version_id;
         self.versions.insert(self.current_version_id, v);
         self.current_version_id = new_version_id;
@@ -384,5 +459,16 @@ impl ServerDbInner {
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
         self.current_version_id = snapshot.version_id;
         self.data = snapshot.data;
+    }
+
+    fn apply_update(&mut self, upd: Update) {
+        match upd {
+            Update::Set(k, v) => {
+                self.data.insert(k, v);
+            }
+            Update::Delete(k) => {
+                self.data.remove(&k);
+            }
+        }
     }
 }
