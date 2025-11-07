@@ -1,17 +1,14 @@
-use rand::prelude::IndexedRandom;
-use std::time::Duration;
 use log::info;
-use std::sync::mpsc;
+use rand::prelude::IndexedRandom;
 use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
 
-use crate::Upstream;
 use crate::Downstream;
 use crate::ServerDb;
-use crate::Request;
-use crate::Notice;
-use crate::Version;
 use crate::Update;
+use crate::Upstream;
+use crate::Version;
 
 /// Number of keys to use in the fake intake.
 const FAKE_INTAKE_NUM_KEYS: usize = 2;
@@ -50,24 +47,11 @@ impl FakeIntake {
     fn run(mut self) {
         loop {
             // Serve some requests
-            loop {
-                match self
-                    .downstream
-                    .requests_rx
-                    .recv_timeout(Duration::from_millis(400))
-                {
-                    Ok(req) => match req {
-                        Request::GetChildVersion(uuid, sender) => {
-                            sender.send(self.server_db.get_child_version(uuid)).expect("send failed");
-                        }
-                        Request::GetSnapshot(sender) => {
-                            sender.send(self.server_db.get_snapshot()).expect("send failed");
-                        }
-                    },
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(e) => panic!("error receiving requests: {e}"),
-                }
-            }
+            self.downstream.serve_requests(
+                |uuid| self.server_db.get_child_version(uuid),
+                || self.server_db.get_snapshot(),
+                Duration::from_millis(400),
+            );
 
             // Create a new version
             let new_version_id = Uuid::new_v4();
@@ -80,7 +64,7 @@ impl FakeIntake {
 
             // Notify downstream of new version
             info!("{}: Sending new-version notice", self.name);
-            self.downstream.notices.broadcast(Notice::NewVersion);
+            self.downstream.notify();
         }
     }
 
@@ -110,4 +94,3 @@ impl FakeIntake {
         updates
     }
 }
-

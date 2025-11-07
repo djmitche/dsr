@@ -51,7 +51,7 @@ impl ServerDb {
             .get_child_version(uuid)
     }
 
-    pub fn get_snapshot(&mut self) -> Snapshot {
+    pub fn get_snapshot(&self) -> Snapshot {
         self.inner.lock().expect("lock failed").get_snapshot()
     }
 

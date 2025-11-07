@@ -8,10 +8,8 @@ mod request;
 pub use request::*;
 mod notice;
 pub use notice::*;
-mod downstream;
-pub use downstream::*;
-mod upstream;
-pub use upstream::*;
+mod api;
+pub use api::*;
 mod cachingintermediate;
 pub use cachingintermediate::*;
 mod debugleaf;
@@ -22,7 +20,7 @@ mod fakeintake;
 pub use fakeintake::*;
 
 // TODO:
-//  - break into modules
-//  - RCU data structure for ServerDb
+//  - better debugging support - a way to inject at the top and examine at the bottom
+//  - filtering
 //  - check for accuracy
 //  - benchmark
